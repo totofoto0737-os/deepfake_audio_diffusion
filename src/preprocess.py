@@ -2,6 +2,7 @@ import numpy as np
 import librosa
 import torch
 import torch.nn.functional as F
+import subprocess
 
 from config import (
     SR,
@@ -18,24 +19,51 @@ from config import (
 def audio_to_mel(path):
 
     # ----------------------------------------------
-    # 1. 오디오 파일 읽기
+    # 1. FFmpeg를 사용해 오디오 파일 읽기
     # ----------------------------------------------
-    # path에 있는 음성 파일을 불러온다.
+    # 기존 librosa.load() 대신 FFmpeg를 사용한다.
     #
-    # y  : 실제 음성 데이터(파형)
-    # sr : 실제 사용된 sampling rate
+    # 기존 문제:
+    # soundfile에서 다음과 같은 오류가 발생할 수 있다.
+    # LibsndfileError: flac decoder lost sync
     #
-    # sr=SR
-    # → 우리가 config.py에서 정한 sampling rate 사용
+    # 해결:
+    # FFmpeg로 오디오를 읽고,
+    # NumPy 배열로 변환한다.
     #
-    # mono=True
-    # → 스테레오라면 왼쪽/오른쪽을 합쳐서
-    #    하나의 음성 채널로 만든다.
-    y, sr = librosa.load(
-        str(path),
-        sr=SR,
-        mono=True
+    # -i : 입력 오디오 파일
+    # -f f32le : 32비트 실수형 오디오 데이터
+    # -acodec pcm_f32le : 출력 오디오를 float32로 설정
+    # -ac 1 : 모노(1채널)로 변환
+    # -ar SR : SR 샘플레이트로 변환
+    # pipe:1 : 파일로 저장하지 않고 메모리로 출력
+
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-v", "error",
+            "-i", str(path),
+            "-f", "f32le",
+            "-acodec", "pcm_f32le",
+            "-ac", "1",
+            "-ar", str(SR),
+            "pipe:1"
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True
     )
+
+    # FFmpeg가 출력한 바이트 데이터를
+    # NumPy의 float32 배열로 변환한다.
+    y = np.frombuffer(
+        result.stdout,
+        dtype=np.float32
+    )
+
+    # FFmpeg에서 이미 SR로 변환했으므로
+    # 현재 샘플레이트는 SR이다.
+    sr = SR
 
 
     # ----------------------------------------------
@@ -56,6 +84,13 @@ def audio_to_mel(path):
     #    ↓
     # Mel-spectrogram
     #
+    # y          : 오디오 파형
+    # sr         : 샘플레이트
+    # n_fft      : FFT 분석 구간 크기
+    # hop_length : 프레임 사이 이동 간격
+    # n_mels     : Mel 주파수 영역의 개수
+    # power=2    : 파워 스펙트로그램 사용
+
     mel = librosa.feature.melspectrogram(
         y=y,
         sr=SR,
@@ -69,7 +104,11 @@ def audio_to_mel(path):
     # ----------------------------------------------
     # 4. 값을 dB 단위로 변환
     # ----------------------------------------------
-    # 사람이 보기 좋은 음량 크기 형태로 변환
+    # 파워 스펙트로그램을 dB 단위로 변환한다.
+    #
+    # ref=np.max
+    # → 가장 큰 값을 기준으로 상대적인 dB를 계산한다.
+
     mel = librosa.power_to_db(
         mel,
         ref=np.max
@@ -83,6 +122,8 @@ def audio_to_mel(path):
     # 가장 작은 값 → 0
     # 가장 큰 값   → 1
     #
+    # 1e-8은 분모가 0이 되는 것을 방지한다.
+
     mel = (
         mel - mel.min()
     ) / (
@@ -97,10 +138,8 @@ def audio_to_mel(path):
     # 현재:
     #     mel = [주파수, 시간]
     #
-    # CNN은 보통:
-    #     [채널, 높이, 너비]
-    #
-    # 그래서 차원을 추가한다.
+    # Tensor로 변환하고 자료형을 float32로 설정한다.
+
     x = torch.tensor(
         mel,
         dtype=torch.float32
@@ -115,7 +154,8 @@ def audio_to_mel(path):
     #       ↓
     # [1, 주파수, 시간]
     #
-    # 1은 흑백 이미지처럼 채널이 1개라는 뜻
+    # 1은 흑백 이미지처럼 채널이 1개라는 뜻이다.
+
     x = x.unsqueeze(0)
 
 
@@ -129,6 +169,7 @@ def audio_to_mel(path):
     #
     # PyTorch 이미지 입력 형태:
     # [배치, 채널, 높이, 너비]
+
     x = x.unsqueeze(0)
 
 
@@ -136,9 +177,15 @@ def audio_to_mel(path):
     # 9. 크기를 IMAGE_SIZE에 맞게 변경
     # ----------------------------------------------
     #
-    # Mel-spectrogram의 크기가
-    # 파일마다 조금씩 다를 수 있기 때문에
-    # 모델에 넣기 전에 동일한 크기로 맞춘다.
+    # Mel-spectrogram의 시간 길이는
+    # 오디오 길이에 따라 달라질 수 있다.
+    #
+    # 따라서 모델에 넣기 전에
+    # 모든 데이터의 크기를 동일하게 맞춘다.
+    #
+    # 결과 크기:
+    # [1, 1, N_MELS, IMAGE_SIZE]
+
     x = F.interpolate(
         x,
         size=(N_MELS, IMAGE_SIZE),
@@ -154,11 +201,12 @@ def audio_to_mel(path):
     # 현재:
     # [1, 1, N_MELS, IMAGE_SIZE]
     #
-    # Dataset에서 하나의 데이터를 반환할 때는
-    # 배치 차원이 필요 없으므로 제거한다.
+    # Dataset에서 데이터 하나를 반환하므로
+    # 배치 차원을 제거한다.
     #
     # 결과:
     # [1, N_MELS, IMAGE_SIZE]
+
     x = x.squeeze(0)
 
 
